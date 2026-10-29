@@ -5,7 +5,7 @@ import time
 import warnings
 from socket import error as SocketError
 
-BALBOA_DEFAULT_PORT = 4257
+BALBOA_DEFAULT_PORT = 8899 #4257
 
 M_STARTEND = 0x7E
 
@@ -779,8 +779,19 @@ class BalboaSpaWifi:
         if not self.connected:
             return None
 
+        # 1. Search for M_STARTEND (0x7E) followed by a non-0x7E length byte to synchronize framing
         try:
-            header = await self.reader.readexactly(2)
+            last_was_7e = False
+            while True:
+                byte = await self.reader.readexactly(1)
+                val = byte[0]
+                if last_was_7e:
+                    if val != M_STARTEND:
+                        rlen = val
+                        break
+                else:
+                    if val == M_STARTEND:
+                        last_was_7e = True
         except SocketError as err:
             if err.errno == errno.ECONNRESET:
                 self.log.error("Connection reset by peer")
@@ -793,24 +804,58 @@ class BalboaSpaWifi:
             self.connected = False
             await self.int_new_data_cb()
             return None
+        except (asyncio.IncompleteReadError, EOFError):
+            self.log.error("Spa connection closed (EOF reached)")
+            self.connected = False
+            await self.int_new_data_cb()
+            return None
         except Exception as e:
             self.log.error("Spa read failed: {0}".format(str(e)))
+            self.connected = False
+            await self.int_new_data_cb()
             return None
 
-        if header[0] == M_STARTEND:
-            # header[1] is size, + checksum + M_STARTEND (we already read 2 tho!)
-            rlen = header[1]
-        else:
+        # Sanity check on packet length. Minimum is 3 bytes, max around 120.
+        if rlen < 3 or rlen > 120:
+            self.log.error("Invalid packet length: {0}".format(rlen))
             return None
 
-        # now get the rest of the data
+        # 2. Read the rest of the message (rlen bytes)
         try:
             data = await self.reader.readexactly(rlen)
+        except SocketError as err:
+            if err.errno == errno.ECONNRESET:
+                self.log.error("Connection reset by peer")
+            elif err.errno == errno.EHOSTUNREACH:
+                self.log.error("Spa unreachable")
+            elif err.errno == errno.EPIPE:
+                self.log.error("Broken pipe")
+            else:
+                self.log.error("Spa socket error: {0}".format(str(err)))
+            self.connected = False
+            await self.int_new_data_cb()
+            return None
+        except (asyncio.IncompleteReadError, EOFError):
+            self.log.error("Spa connection closed during data read (EOF reached)")
+            self.connected = False
+            await self.int_new_data_cb()
+            return None
         except Exception as e:
-            self.log.errpr("Spa read failed: {0}".format(str(e)))
+            self.log.error("Spa read failed during data read: {0}".format(str(e)))
+            self.connected = False
+            await self.int_new_data_cb()
             return None
 
-        full_data = header + data
+        full_data = bytearray(2 + len(data))
+        full_data[0] = M_STARTEND
+        full_data[1] = rlen
+        full_data[2:] = data
+
+        # Check ending flag
+        if full_data[-1] != M_STARTEND:
+            self.log.error("Message missing end flag, framing error")
+            return None
+
         # don't count M_STARTENDs or CHKSUM (remember that rlen is 2 short)
         crc = self.balboa_calc_cs(full_data[1:], rlen - 1)
         if crc != full_data[-2]:
@@ -818,7 +863,8 @@ class BalboaSpaWifi:
             return None
 
         # self.log.error('got update: {}'.format(full_data.hex()))
-        return full_data
+        return bytes(full_data)
+
 
     async def check_connection_status(self):
         """ Set this up to periodically check the spa connection and fix. """

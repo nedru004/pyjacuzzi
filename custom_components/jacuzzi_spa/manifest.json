@@ -1,0 +1,9 @@
+{
+  "domain": "jacuzzi_spa",
+  "name": "Jacuzzi Spa",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/dhmsjs/pyjacuzzi",
+  "iot_class": "local_polling",
+  "version": "1.0.0"
+}

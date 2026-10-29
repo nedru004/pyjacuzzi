@@ -23,7 +23,7 @@ import time
 import random
 
 # Change this to your spa's ip address
-DEFAULT_SPA_IP_ADDR = "192.168.6.156"
+DEFAULT_SPA_IP_ADDR = "192.168.0.8"
 
 def setup_ui_display(spa_ui):
     """ Defines all the Windows for the Jacuzzi Spa UI. """
@@ -43,6 +43,7 @@ def setup_ui_display(spa_ui):
              "<Enter> to go in selected\n"
              "<Esc> to go back out\n"
              "Ctrl-p adds a message\n"
+             "Ctrl-t try spa clock (panel)\n"
              "Arrows scroll messages\n"
              "Resize at will\n"
              "Ctrl-x to exit")
@@ -349,7 +350,11 @@ def setup_ui_display(spa_ui):
         # 
         # Note that we use a lambda to include the newtemp parameter
         # with the coroutine.
-        spa_ui.add_coroutine(lambda: spa.send_temp_change(newtemp))
+        try:
+            val = float(newtemp)
+            spa_ui.add_coroutine(lambda: spa.send_temp_change(val))
+        except ValueError:
+            pass
 
     # Now add the dialog to the Textfield
     tsetdialog = EditDialog(spa_ui.display, 
@@ -432,8 +437,11 @@ def setup_ui_display(spa_ui):
         # 
         # Note that we use a lambda to include the new_time parameter
         # with the coroutine.
-        new_time = time.strptime(time_text, "%H:%M")
-        spa_ui.add_coroutine(lambda: spa.set_time(new_time))
+        try:
+            new_time = time.strptime(time_text, "%H:%M")
+            spa_ui.add_coroutine(lambda: spa.set_time(new_time))
+        except ValueError:
+            pass
 
     # Now add the text dialog to the Textfield
     timesetdialog = TextDialog(spa_ui.display,
@@ -454,7 +462,13 @@ def setup_ui_display(spa_ui):
         # 
         # Note that we use a lambda to include the new_date parameter
         # with the coroutine.
-        new_date = time.strptime(date_text, "%m/%d/%y")
+        try:
+            new_date = time.strptime(date_text, "%m/%d/%y")
+        except ValueError:
+            try:
+                new_date = time.strptime(date_text, "%m/%d/%Y")
+            except ValueError:
+                return
         spa_ui.add_coroutine(lambda: spa.set_date(new_date))
 
     # Now add the text dialog to the Textfield
@@ -932,6 +946,29 @@ def setup_ui_responses(spa_ui):
     # Bind Ctrl-p to its local response routine
     ctrl_p_key.bind(_kr_ctrl_p_response)
 
+    # Ctrl-t: set spa date/time to current local time
+    ctrl_t_key = KeyResponse("ctrl_t", ord(curses.ascii.ctrl('t')))
+    spa_ui.display.add_key(ctrl_t_key)
+
+    def _kr_ctrl_t_response(_):
+        s = getattr(spa_ui, "spa", None)
+        if s is None:
+            return
+        print("Syncing spa date/time to local clock...")
+
+        async def _do_sync():
+            ok = await s.ensure_clock_synced()
+            if ok:
+                print("Spa clock synced.")
+            else:
+                print(
+                    "Spa did not accept remote date/time — set it on the topside panel."
+                )
+
+        spa_ui.add_coroutine(_do_sync)
+
+    ctrl_t_key.bind(_kr_ctrl_t_response)
+
     # Create and install the KeyResponse instance for TAB
     tab_key = KeyResponse("tab", curses.ascii.TAB)
     spa_ui.display.add_key(tab_key)
@@ -977,6 +1014,7 @@ if __name__ == "__main__":
     spa_ui = CursesUI(setup_ui_display, 
                       setup_ui_responses,
                       "Jacuzzi Spa UI")
+    spa_ui.spa = spa
 
     # Tell the spa instance to use the CursesUI logging instance
     spa.log = log

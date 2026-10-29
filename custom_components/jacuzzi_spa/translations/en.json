@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Jacuzzi Spa",
+        "description": "Connect to your RS485-to-TCP bridge (encrypted Jacuzzi / Sundance controllers supported).",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the spa bridge. Check the host and port.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This spa bridge is already configured"
+    }
+  }
+}

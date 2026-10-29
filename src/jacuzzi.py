@@ -21,6 +21,7 @@ v0.13 without careful attention -- which given the light dependency, is
 probably not worth the effort.
 """
 import asyncio
+from collections import deque
 import errno
 import logging
 import time
@@ -97,7 +98,7 @@ text_tscale = ["Fahrenheit", "Celsius"]   # Just to fix the misspelling
 class JacuzziSpaWifi(BalboaSpaWifi):
     """Extends BalboaSpaWifi to work with Jacuzzi spas instead. """
 
-    def __init__(self, hostname, port=BALBOA_DEFAULT_PORT):
+    def __init__(self, hostname, port=8899):
         super().__init__(hostname, port)      
         self.connection_state = ConnectionStates.Disconnected
 
@@ -195,11 +196,23 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         # per second (I think).
         # self.lightCycleTime = 1 # In seconds. 
 
-        # The Prolink Wifi module always has channel address 0x0A
-        # but it's still a class attribute here in order to support
-        # future custom (non-Prolink) RS485-to-TCP devices which may
-        # need different channel addresses.
+        # Address / channel byte used by the RS485-to-TCP bridge.
+        #
+        # Many examples assume 0x0A, but some devices use different values
+        # (for example 0x10). We default to 0x0A for compatibility, but
+        # we also auto-learn the correct value from incoming packets and
+        # then use it for outgoing commands.
         self.channel = 0x0A
+
+        # Buffered TCP receive state (Prolink stream can be bursty and contain
+        # back-to-back frames like ...7e7e...).
+        self._rxbuf = bytearray()
+
+        # TX gating for RS485 bridges that require CLEAR_TO_SEND (0x06) tokens.
+        # We queue frames and only transmit one immediately after receiving 0x06.
+        self._tx_queue = deque()
+        self._tx_can_send = False
+        self._tx_lock = asyncio.Lock()
 
         # setup some specific items that we need that the base class
         # doesn't.
@@ -217,6 +230,24 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         # not in the tub itself as the primary sensor is. So this
         # one tells you what the water temperature in the pipes is.
         self.statusByte21 = 0
+
+    async def _tx_flush_one(self):
+        """Send at most one queued frame if CTS allows it."""
+        async with self._tx_lock:
+            if not self.connected:
+                return
+            if not self._tx_can_send:
+                return
+            if not self._tx_queue:
+                return
+            frame = self._tx_queue.popleft()
+            self._tx_can_send = False
+            try:
+                self.writer.write(frame)
+                await self.writer.drain()
+            except Exception as e:
+                self.log.error(f"Error sending message: {e}")
+                return
   
     def decrypt(self, packet: bytearray) -> bytearray:
         """ Returns a decrypted version of type "C4" panel status and type
@@ -310,10 +341,16 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         # is in the form of unencrypted_type: encrypted_equivalent.
         etypes = {
                   0x11: 0xcc, # Balboa unencrypted button control message type
-                  0x17: 0xcc, # Jacuzzi unencrypted pump 1-3 control message type
-                  0x1a: 0xcc, # Jacuzzi unencrypted pump 4-6 control message type
+                  0x17: 0xcc, # Jacuzzi pump 1-3 / some button controls
+                  0x18: 0xcc, # Jacuzzi set time/date message type
+                  # Note: do NOT map 0x21 here. On Jacuzzi encrypted boards, 0x21 is
+                  # used for long light/brightness packets; encrypting them as 0xCC
+                  # button frames breaks them. Balboa short set-time uses 0x21, but
+                  # Jacuzzi set-time uses 0x18 (mapped above).
+                  0x1f: 0xcc, # Lock / unlock control message type
+                  0x1a: 0xcc, # Jacuzzi button / pump 4-6 control message type
                   0x1b: 0xcc, # Jacuzzi Send Primary Filter Request message type
-                  0x20: 0xcc, # Balboa and Jacuzzi Set Target Temp message type
+                  0x20: 0xcc, # Set Target Temp message type (encrypt for encrypted controllers)
                  }
 
         # Quit if this packet type has no encrypted equivalent
@@ -328,17 +365,27 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         # Write the new encrypted packet type into the packet.
         packet[4] = etypes[packet_type]
 
-        # Insert the extra encryption key byte into the packet. For now
-        # the key byte is a simple constant, and add 1 to the packet
-        # length byte and update the local packet_length variable
-        # with the new length value.
-        packet.insert(5, 0x00)
+        # Insert the extra encryption key byte into the packet.
+        #
+        # IMPORTANT: Do NOT force this key byte to 0 or overwrite it later.
+        # Real devices use non-zero values here, and some controllers appear
+        # to ignore commands that don't follow that convention.
+        #
+        # The value itself doesn't need to match the controller's incoming
+        # key byte, but it must be self-consistent with the XOR cipher we
+        # apply below. We choose a stable non-zero constant for repeatability.
+        key_byte = 0xB0
+        packet.insert(5, key_byte)
         packet[1] += 1
         packet_length = packet[1]
 
-        # Encrypt the new packet by "decrypting" the unencrypted message
-        # data. (XOR ciphers are symmetric.)
-        packet = self.decrypt(packet)
+        # Encrypt the packet data fields using the same XOR cipher as decrypt().
+        HEADER_LENGTH = 5
+        key1 = key_byte ^ 0xDF  # 0xDF constant for button command packets
+        key2 = packet_length - HEADER_LENGTH - 2
+        for i in range(6, packet_length):
+            key2 = (key2 - 1) % 64
+            packet[i] = packet[i] ^ key1 ^ key2
      
         # Calculate a new checksum for the new, encrypted packet and save
         # it in the packet.
@@ -379,10 +426,13 @@ class JacuzziSpaWifi(BalboaSpaWifi):
     async def send_mod_ident_req(self):
         """ Overrides parent method just to add debug logging. """
         self.log.debug("Requesting module ID (msg type value 0x04)")
-        await super().send_mod_ident_req()
+        # Don't rely on balboa.py's hardcoded address byte (0x0A) in mtypes.
+        # Use the learned channel.
+        await self.send_message(self.channel, 0xBF, 0x04)
 
     async def send_temp_change(self, newtemp):
-        """ Overrides the parent method to support encrypted spa controllers """
+        """ Sets the target temperature on the spa controller. """
+        newtemp = float(newtemp)
         # Check if the new temperature is valid for the current heat mode
         if (
             newtemp < self.tmin[self.temprange][self.tempscale]
@@ -391,71 +441,190 @@ class JacuzziSpaWifi(BalboaSpaWifi):
             self.log.error("Attempt to set temperature outside of heat mode boundary")
             return
 
-        if not self.encrypted_comm:
-            if self.tempscale == self.TSCALE_C:
-                newtemp *= 2.0
-            await self.send_message(*mtypes[BMTS_SET_TEMP], int(round(newtemp)))
+        if self.tempscale == self.TSCALE_C:
+            temp_val = int(round(newtemp * 2.0))
         else:
-            # Encrypted controllers do not seem to support a command to set the
-            # the target temperature to an arbitrary value. Instead it seems the
-            # only way to change setpoint is to send a series of "Temp Up" or 
-            # "Temp Down" button commands until the controller setpoint equals
-            # the new target setpoint value.
-            #
-            # We do this by starting an asynchronous task to periodically
-            # send Temp Up or Temp Down button commands until the controller
-            # reports a setpoint temperature that is equal to newtemp.
+            temp_val = int(round(newtemp))
 
-            async def _adjust_encrypted_settemp():
-                # This local coroutine asynchronously sends Temp Up or 
-                # Temp Down button commands until the controller's 
-                # setpoint temperature equals the new setpoint temperature.
-                # It must be defined before referencing it in the call to
-                # asyncio.create_task() below.
+        # Encrypted Jacuzzi/Sundance boards (0xC4 status) ignore the direct
+        # "set temp to value" command (0x20 -> encrypted 0xCC). Live testing on
+        # RS485 bridges shows Temp Up / Temp Down button presses work instead:
+        #   channel BF 1A 01  = Temp Up
+        #   channel BF 1A 02  = Temp Down
+        # (encrypt() maps 0x1A -> 0xCC). First press after idle can be dropped,
+        # so we retry until status reports a change.
+        if self.encrypted_comm:
+            target = newtemp
 
-                settemp_changed = True
-                while True:
-                    # If we lost connection then just end the coroutine.
-                    if not self.connected:
-                        self.encrypted_settemp_task = None
+            def _cur_settemp() -> float:
+                return float(self.settemp) if self.settemp is not None else float("nan")
+
+            # Wait for a real setpoint before deciding direction.
+            for _ in range(25):  # ~5s
+                cur0 = _cur_settemp()
+                if cur0 not in (0.0,) and cur0 == cur0:  # not NaN
+                    break
+                await asyncio.sleep(0.2)
+
+            if abs(_cur_settemp() - target) < 0.5:
+                self.log.info(f"Setpoint already {self.settemp} (target {target})")
+                return
+
+            if self.encrypted_settemp_task is not None:
+                self.encrypted_settemp_task.cancel()
+                try:
+                    await self.encrypted_settemp_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                self.encrypted_settemp_task = None
+
+            self.encrypted_settemp = target
+
+            async def _adjust():
+                max_presses = 40
+                presses = 0
+                no_update_streak = 0
+
+                while presses < max_presses and self.connected:
+                    cur = _cur_settemp()
+                    if abs(cur - target) < 0.5:
+                        self.log.info(
+                            f"Reached target setpoint {cur} (target {target}) after {presses} presses"
+                        )
                         return
-                    # Only send a new button command after the previous
-                    # one has been effective.
-                    if settemp_changed:
-                        # Remember the new setpoint temp
-                        cursettemp = self.settemp
 
-                        # Decide which direction to go
-                        reqd_change = self.encrypted_settemp - cursettemp
-                        if reqd_change >= 1:
-                            btncode = 0x01
-                        elif reqd_change <= -1:
-                            btncode = 0x02
-                        else:
-                            # We are within 1 degree of setpoint so end this
-                            # coroutine.
-                            self.encrypted_settemp_task = None
-                            return
+                    btncode = 0x01 if cur < target else 0x02  # TempUp / TempDown
+                    await self.send_message(self.channel, 0xBF, 0x1A, btncode)
+                    presses += 1
 
-                        # Send a new button command to change setpoint temp.
-                        # This unencrypted button command will be converted
-                        # to an encrypted version by send_message()
-                        data = bytearray(4)
-                        data[0] = self.channel
-                        data[1] = 0xBF
-                        data[2] = 0x1A 
-                        data[3] = btncode
-                        await self.send_message(*data)
+                    prev = cur
+                    changed = False
+                    for _ in range(16):  # ~3.2s
+                        await asyncio.sleep(0.2)
+                        if _cur_settemp() != prev:
+                            changed = True
+                            break
 
-                    # Wait a bit before checking the new setpoint temp
-                    await asyncio.sleep(1.0)
-                    settemp_changed = cursettemp != self.settemp
+                    if changed:
+                        no_update_streak = 0
+                    else:
+                        no_update_streak += 1
+                        if no_update_streak in (3, 6, 10):
+                            self.log.warning(
+                                f"Setpoint not updating (still {prev}) after {presses} presses; retrying"
+                            )
+                        # Brief pause before retry — helps after a dropped first TX.
+                        await asyncio.sleep(0.4)
 
-            # Save the new target setpoint temperature
-            self.encrypted_settemp = newtemp
-            # Start the settemp adjustment task if it is not already running
-            if self.encrypted_settemp_task is None:
-                self.encrypted_settemp_task = asyncio.create_task(_adjust_encrypted_settemp())
+                self.log.warning(
+                    f"Temperature adjust gave up after {presses} presses "
+                    f"(current {self.settemp}, target {target})"
+                )
+
+            self.encrypted_settemp_task = asyncio.create_task(_adjust())
+            return
+
+        # Non-encrypted controllers: direct setpoint command works.
+        await self.send_message(self.channel, 0xBF, 0x20, temp_val)
+
+
+
+    async def change_aux(self, aux, newstate):
+        """ Override parent method to support encrypted Jacuzzi spas. """
+        if not self.encrypted_comm:
+            await super().change_aux(aux, newstate)
+            return
+
+        # sanity check
+        if (
+            aux > 1
+            or not self.aux_array[aux]
+            or self.aux_status[aux] == newstate
+        ):
+            return
+
+        data = bytearray(4)
+        data[0] = self.channel
+        data[1] = 0xBF
+        data[2] = 0x1A
+        data[3] = 0x16 if aux == 0 else 0x17
+        await self.send_message(*data)
+
+    async def change_mister(self, newmode):
+        """ Override parent method to support encrypted Jacuzzi spas. """
+        if not self.encrypted_comm:
+            await super().change_mister(newmode)
+            return
+
+        # sanity check
+        if not self.mister or self.mister_status == newmode:
+            return
+
+        data = bytearray(4)
+        data[0] = self.channel
+        data[1] = 0xBF
+        data[2] = 0x1A
+        data[3] = 0x0E
+        await self.send_message(*data)
+
+    async def change_blower(self, newstate):
+        """ Override parent method to support encrypted Jacuzzi spas. """
+        if not self.encrypted_comm:
+            await super().change_blower(newstate)
+            return
+
+        # sanity check
+        if (
+            not self.blower
+            or newstate > self.blower
+            or self.blower_status == newstate
+        ):
+            return
+
+        # calculate how many times to push the button
+        iter = max((newstate - self.blower_status) % (self.blower + 1), 1)
+        for i in range(0, iter):
+            data = bytearray(4)
+            data[0] = self.channel
+            data[1] = 0xBF
+            data[2] = 0x1A
+            data[3] = 0x0C
+            await self.send_message(*data)
+            await asyncio.sleep(1.0)
+
+    async def change_temprange(self, newmode):
+        """ Override parent method to support encrypted Jacuzzi spas. """
+        if not self.encrypted_comm:
+            await super().change_temprange(newmode)
+            return
+
+        if newmode > 1 or self.temprange == newmode:
+            return
+
+        data = bytearray(4)
+        data[0] = self.channel
+        data[1] = 0xBF
+        data[2] = 0x1A
+        data[3] = 0x50
+        await self.send_message(*data)
+
+    async def change_heatmode(self, newmode):
+        """ Override parent method to support encrypted Jacuzzi spas. """
+        if not self.encrypted_comm:
+            await super().change_heatmode(newmode)
+            return
+
+        if self.heatmode == newmode:
+            return
+
+        data = bytearray(4)
+        data[0] = self.channel
+        data[1] = 0xBF
+        data[2] = 0x1A
+        data[3] = 0x51
+        await self.send_message(*data)
 
     async def send_filter1_cycle_req(self):
         """ Sends a request for Primary Filter Cycle Info. """
@@ -593,65 +762,161 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         """ Allow pumps to run (after servicing) """
         await self._send_lock_req(0x44)
 
+    # Prolink Set Time month bytes (see docs/ProlinkMessageTypes.txt).
+    _PROLINK_MONTH_CODES = (
+        0,
+        0xF1,
+        0xF2,
+        0xF3,
+        0xF3,  # April (duplicate code in Prolink app)
+        0xF4,
+        0xF5,
+        0xF6,
+        0xF7,
+        0xF8,
+        0xF9,
+        0xFB,  # November (skips 0xFA)
+        0xFC,
+    )
+
+    @classmethod
+    def _month_code(cls, tm_mon: int) -> int:
+        """Return the Prolink month byte for struct_time.tm_mon (1-12)."""
+        if 1 <= tm_mon <= 12:
+            return cls._PROLINK_MONTH_CODES[tm_mon]
+        return (tm_mon & 0x0F) | 0xF0
+
+    async def set_datetime(self, when=None):
+        """Set spa date and time from a struct_time (default: local now)."""
+        if when is None:
+            when = time.localtime()
+        elif not isinstance(when, time.struct_time):
+            return
+
+        data = bytearray(8)
+        data[0] = self.channel
+        data[1] = 0xBF
+        data[2] = 0x18
+        data[3] = self._month_code(when.tm_mon)
+        data[4] = when.tm_mday
+        data[5] = when.tm_year - 2000
+        data[6] = when.tm_hour
+        data[7] = when.tm_min
+
+        self.log.info(
+            "Setting spa clock to {0:04d}-{1:02d}-{2:02d} {3:02d}:{4:02d}".format(
+                when.tm_year, when.tm_mon, when.tm_mday, when.tm_hour, when.tm_min
+            )
+        )
+        await self.send_message(*data)
+
+    def _datetime_matches(self, when: time.struct_time, within_minutes: int = 3) -> bool:
+        """Return True if parsed spa clock matches *when* (local struct_time)."""
+        if self.currentYear != when.tm_year:
+            return False
+        if self.currentMonth != when.tm_mon:
+            return False
+        if self.dayOfMonth != when.tm_mday:
+            return False
+        if self.time_hour is None or self.time_minute is None:
+            return False
+        spa_mins = int(self.time_hour) * 60 + int(self.time_minute)
+        want_mins = when.tm_hour * 60 + when.tm_min
+        return abs(spa_mins - want_mins) <= within_minutes
+
+    async def ensure_clock_synced(self, attempts: int = 3) -> bool:
+        """Try to set the spa clock to local time; return True if status confirms it."""
+        if not self.connected:
+            return False
+
+        # Wait until encrypted mode is known (C4 seen) so commands use 0xCC if needed.
+        for _ in range(50):
+            if self.encrypted_comm:
+                break
+            await asyncio.sleep(0.2)
+
+        target = time.localtime()
+        for n in range(attempts):
+            await self.unlock_settings()
+            await asyncio.sleep(0.3)
+            await self.set_datetime(target)
+            for _ in range(24):
+                await asyncio.sleep(0.5)
+                if self._datetime_matches(target):
+                    self.log.info(
+                        "Spa clock synced to {0:04d}-{1:02d}-{2:02d} {3:02d}:{4:02d}".format(
+                            target.tm_year,
+                            target.tm_mon,
+                            target.tm_mday,
+                            target.tm_hour,
+                            target.tm_min,
+                        )
+                    )
+                    return True
+            self.log.debug(f"Clock sync attempt {n + 1}/{attempts} not confirmed yet")
+
+        self.log.warning(
+            "Spa did not accept a remote date/time set (still shows {0}). "
+            "Many RS485 setups allow temperature control but not clock changes; "
+            "set the date and time on the topside panel if needed.".format(
+                self.get_spadate_text()
+            )
+        )
+        return False
+
+    async def set_datetime_now(self):
+        """Set spa date and time to the current local date and time."""
+        await self.ensure_clock_synced(attempts=2)
+
     async def set_time(self, new_time, timescale=None):
-        """ Overrides the parent method to set time on a Jacuzzi spa.
-        Jacuzzi spa controllers do not switch to 12 hour timescale,
-        so this method override ignores the timescale field.
-        """
-        # sanity check
+        """Set spa time; keeps the current spa date."""
         if not isinstance(new_time, time.struct_time):
             return
-
-        data = bytearray(8)
-        data[0] = self.channel
-        data[1] = 0xBF
-        data[2] = 0x18      # Was 0x21 for Balboa
-
-        # Keep the date fields unchanged. The spa control system
-        # will ignore this command if the upper 4 bits of the current
-        # month are not all set to 1.
-        data[3] = self.currentMonth | 0xF0
-        data[4] = self.dayOfMonth
-        data[5] = self.currentYear - 2000
-
-        # In balboa spas setting bit 7 of the hour value will switch the 
-        # spa time to 12 hour format. Jacuzzi spa controllers ignore this
-        # bit though, so Jacuzzi spas will only operate in 24 hour mode.
-        data[6] = new_time.tm_hour
-        data[7] = new_time.tm_min
-
-        # send_message() will append the start and end flags, the length
-        # and the checksum.
-        await self.send_message(*data)
+        when = time.struct_time(
+            (
+                self.currentYear,
+                self.currentMonth,
+                self.dayOfMonth,
+                new_time.tm_hour,
+                new_time.tm_min,
+                0,
+                0,
+                0,
+                -1,
+            )
+        )
+        await self.set_datetime(when)
 
     async def set_date(self, new_date, timescale=None):
-        """ Sets the current date on a Jacuzzi spa. Since balboa
-        spas do not have an internal date, there is no equivalent
-        method in balboa.py.
-        """
-        # sanity check
+        """Set spa date; keeps the current spa time."""
         if not isinstance(new_date, time.struct_time):
             return
+        when = time.struct_time(
+            (
+                new_date.tm_year,
+                new_date.tm_mon,
+                new_date.tm_mday,
+                self.time_hour,
+                self.time_minute,
+                0,
+                0,
+                0,
+                -1,
+            )
+        )
+        await self.set_datetime(when)
 
-        data = bytearray(8)
-        data[0] = self.channel
-        data[1] = 0xBF
-        data[2] = 0x18      # Was 0x21 for Balboa
-
-        # Update the Set Time command date fields. The Jacuzzi spa
-        # control system will ignore this command if the upper 4
-        # bits of the current month are not all set to 1.
-        data[3] = new_date.tm_mon | 0xF0
-        data[4] = new_date.tm_mday
-        data[5] = new_date.tm_year - 2000
-
-        # Leave the time fields unchanged
-        data[6] = self.time_hour
-        data[7] = self.time_minute
-
-        # send_message() will append the start and end flags, the length
-        # and the checksum.
-        await self.send_message(*data)
+    async def _press_until(self, mtype, code, is_done, max_presses=6, settle=1.2):
+        """Send a button-style command until is_done() is true or presses exhausted."""
+        for n in range(max_presses):
+            if is_done():
+                return True
+            await self.send_message(self.channel, 0xBF, mtype, code)
+            for _ in range(int(settle / 0.25)):
+                await asyncio.sleep(0.25)
+                if is_done():
+                    return True
+        return is_done()
 
     async def change_pump(self, pump, newstate):
         """Overrides the parent method to accommodate differences
@@ -663,7 +928,7 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         # Each message sent emulates a button press on the Jacuzzi
         # topside control panel. So if a pump has two speeds for
         # example, then each message will effect one step through
-        # the cycle of 0ff-low-high-off.
+        # the cycle of off-low-high-off.
         #
         # The only difference between Balboa and Jacuzzi change pump
         # message packets (apart from type value itself) is that the
@@ -687,29 +952,48 @@ class JacuzziSpaWifi(BalboaSpaWifi):
             mtype = 0x1A
         pumpcode = pump + 3
 
-        data = bytearray(4)
-        data[0] = self.channel
-        data[1] = 0xBF
-        data[2] = mtype      # Was 0x11 for balboa
-        data[3] = pumpcode
-
-        # calculate how many times to push the button
-        # iterations = (divisor + (newstate - currentstate)) % divisor
+        # Press until we observe the target state. Calculated step counts are
+        # unreliable when a press is dropped on the RS485 bridge.
         divisor = self.pump_array[pump] + 1
-        delta = newstate - self.pump_status[pump]
-        iter = (divisor + delta) % divisor
+        max_presses = max(divisor * 3, 6)
+        for _ in range(max_presses):
+            if self.pump_status[pump] == newstate:
+                return
+            before = self.pump_status[pump]
+            await self.send_message(self.channel, 0xBF, mtype, pumpcode)
+            changed = False
+            for _ in range(8):  # ~2s
+                await asyncio.sleep(0.25)
+                if self.pump_status[pump] != before:
+                    changed = True
+                    break
+            if not changed:
+                await asyncio.sleep(0.4)
 
-        # now push the button that number of times
-        for i in range(0, iter):
-            # send_message() will append the start and end flags, the length
-            # and the checksum.
-            await self.send_message(*data)
-            await asyncio.sleep(1.0)
+        if self.pump_status[pump] != newstate:
+            self.log.warning(
+                f"Pump {pump} ended at {self.pump_status[pump]}, wanted {newstate}"
+            )
 
     async def change_light(self, newmode):
         """Overrides the parent method to accommodate differences
         in the Prolink message type fields.
         """
+        if self.encrypted_comm:
+            # Encrypted boards: Light 1 button (0x1A / 0x11) toggles between
+            # off (mode 0, RGB 0) and color-cycle (mode 0x80). Absolute color
+            # modes from the Prolink app are not reliably accepted over RS485.
+            before = (self.lightMode, self.lightR, self.lightG, self.lightB)
+            ok = await self._press_until(
+                0x1A,
+                0x11,
+                lambda: (self.lightMode, self.lightR, self.lightG, self.lightB) != before,
+                max_presses=4,
+                settle=1.5,
+            )
+            if not ok:
+                self.log.warning("Light button press did not change CA light status")
+            return
 
         # Note that this is the same message type as brightness
         # control, with only slight differences in content.
@@ -732,6 +1016,14 @@ class JacuzziSpaWifi(BalboaSpaWifi):
 
     async def change_brightness(self, newlevel):
         """Sends a command to change the LED brightness level."""
+        if self.encrypted_comm:
+            # Absolute brightness is not accepted on this encrypted RS485 path.
+            # Light power/color is toggled via change_light() instead.
+            self.log.warning(
+                "Absolute brightness set is not supported on encrypted RS485; "
+                "use light toggle instead"
+            )
+            return
 
         # Note that this is the same message type as light mode
         # control, with only slight differences in content.
@@ -812,7 +1104,7 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         # so the UI can see the change.
         await self.send_filter2_cycle_req()
 
-    async def send_message(self, *bytes):
+    async def send_message(self, *payload):
         """ Overrides parent method only to change log messaging
         and to add support for encrypted command messages.
         """
@@ -820,23 +1112,25 @@ class JacuzziSpaWifi(BalboaSpaWifi):
         if not self.connected:
             return
 
-        message_length = len(bytes) + 2
+        message_length = len(payload) + 2
         data = bytearray(message_length + 2)
         data[0] = M_STARTEND
         data[1] = message_length
-        data[2:message_length] = bytes
+        data[2:message_length] = payload
         data[-2] = self.balboa_calc_cs(data[1:message_length], message_length - 1)
         data[-1] = M_STARTEND
 
         if self.encrypted_comm:
             data = self.encrypt(data)
 
-        self.log.info(f"Sending: {data.hex()}")
-        try:
-            self.writer.write(data)
-            await self.writer.drain()
-        except Exception as e:
-            self.log.error(f"Error sending message: {e}")
+        # Queue the frame; many RS485-to-TCP bridges require us to wait for a
+        # CLEAR_TO_SEND (0x06) token from the bus before transmitting.
+        self.log.info(f"Queueing: {data.hex()}")
+        async with self._tx_lock:
+            self._tx_queue.append(bytes(data))
+
+        # Attempt to flush immediately if we have CTS.
+        await self._tx_flush_one()
  
     def parse_status_update(self, data):
         """ Override balboa's parsing of a status update from the spa
@@ -1153,9 +1447,8 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         self.dayOfWeek = (data[20] & 0x07)        # Not sure this is correct
         self.dayOfMonth = (data[19] & 0xF8) >> 3
 
-        # Have not found this yet
-        # Byte 8 = currentMonth
-        # self.currentMonth = (data[20] & 0x7)
+        # Decoded month value from linear mapping: month = data[20] - 24 (constrained to 1-12)
+        self.currentMonth = max(1, min(12, data[20] - 24))
 
         # Byte 24 = currentYear (since 2000)
         self.currentYear = data[24] + 2000
@@ -1188,11 +1481,18 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         # Byte 13 = don't care? (0xFA)
         # self.statusByte13 = data[13]
 
-        # Modified for Prolink; was data[25] for Balboa 
+        # Modified for Prolink; was data[25] for Balboa
+        # Parse scale before temperatures (same byte layout as unencrypted status).
+        if data[18] & 0x01:
+            self.tempscale = self.TSCALE_C
+        else:
+            self.tempscale = self.TSCALE_F
+
         settemp = float(data[21])
         self.curtemp = curtemp / (2 if self.tempscale ==
                                self.TSCALE_C else 1) if curtemp != 255 else None
         self.settemp = settemp / (2 if self.tempscale == self.TSCALE_C else 1)
+        self.log.debug(f"C4 status parsed: curtemp={self.curtemp} settemp={self.settemp}")
 
         # Byte 15 Bits 7,6 = Pump3State
         # Byte 15 Bits 5,4 = Pump2State (bit posn off by 1??)
@@ -1263,9 +1563,9 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         # All of these except isSecondaryOn will come on during
         # a filter cycle and also whenever pump 1 is turned on
         # manually. 
-        # self.isSecondaryOn = (data[16] & 0xC0) >> 6
-        # self.isPrimaryOn = (data[16] & 0x30) >> 4
-        # self.isBlowerOn = (data[16] & 0x0C) >> 2
+        self.isSecondaryOn = (data[16] & 0xC0) >> 6
+        self.isPrimaryOn = (data[16] & 0x30) >> 4
+        self.isBlowerOn = (data[16] & 0x0C) >> 2
 
         # Byte 16 Bits 2,1 = IsUVON
         # Byte 7 Bit 6 = UV On (0b0, 0x00, 0x40, 0x60)
@@ -1279,14 +1579,14 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         # and actually is equivalent to filter_mode in Balboa.
         # If so then this should actually be:
         # self.filter_mode = (data[16] & 0x0C) >> 2
-        # self.filter_mode = (data[16] & 0x30) >> 4
+        self.filter_mode = (data[16] & 0x30) >> 4
 
         # It does not appear that any Jacuzzi hot tub has a blower
         # (at least at this time). This status is always on whenever
         # pump 1 is on.
-        # if self.blower:
+        if self.blower:
             # Modified for Prolink; was data[18]. Same bits as isBlowerOn
-            # self.blower_status = (data[16] & 0x0c) >> 2
+            self.blower_status = (data[16] & 0x0c) >> 2
 
         # Byte 17 = don't care?
         # In Prolink byte17 seems to indicate that pump 1 is running
@@ -1296,86 +1596,54 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         # end of a filter cycle though; turning off and back on
         # briefly. Perhaps this is a flow sensor signal?
         # UPDATE: Yes I believe it is the flow switch signal
-        # self.statusByte17 = data[17]
+        self.statusByte17 = data[17]
 
         # Modified for Prolink; was data[14] ; logic reversed??
         # TODO: resolve the logic reversal question
         # (12 hr only if both bits 2 & 1 are 0) (= 0x02)
-        # if data[18] & 0x06 == 0:
-            # self.timescale = self.TIMESCALE_12H
-        # else:
-            # self.timescale = self.TIMESCALE_24H
-
-        # Modified for Prolink; was data[14] for Balboa (= 0x02)
-        # if data[18] & 0x01:
-            # self.tempscale = self.TSCALE_C
-        # else:
-            # self.tempscale = self.TSCALE_F
+        if data[18] & 0x06 == 0:
+            self.timescale = self.TIMESCALE_12H
+        else:
+            self.timescale = self.TIMESCALE_24H
 
         # Byte 19 = don't care? (= 0x00)
-        # self.statusByte19 = data[19]
+        self.statusByte19 = data[19]
 
-        # for i in range(0, 2):
-            # if not self.light_array[i]:
-                # continue
-            # Prolink light bits unclear; data[19] is unused??
-            # Yes it appears data[19] does not hold light status.
-            # Instead the light status is contained in message
-            # type 0x23.
-            # self.light_status[i] = ((data[19] >> i*2) & 0x03) >> 1
+        # Lock states for encrypted spas
+        # Map locks using the same bitmask as unencrypted but on data[22] (which is 0x00 on the encrypted spa,
+        # ensuring locks are correctly reported as 0/Unlocked rather than leaking date/month values).
+        self.tempLock = (data[22] & 0x08) >> 3
+        self.settingsLock = (data[22] & 0x04) >> 2
+        self.accessoriesLock = (data[22] & 0x02) >> 1
+        self.serviceLock = (data[22] & 0x01)
+        self.panelLock = self.settingsLock
 
-        # Byte 20 Bits 5,4 = settingLock
-        # Byte 20 Bits 3,2 = accessLock
-        # Byte 20 Bits 1,0 = maintenanceLock (Bit posn error off by 1??)
-        # self.settingLock = (data[20] & 0x30) >> 4
-        # self.accessLock = (data[20] & 0x0C) >> 2
-        # self.serviceLock = (data[20] & 0x03)
+        # Byte 33 = actually 2nd sensor of current water temp (plumbing/heater)
+        self.statusByte21 = data[33]
+        self.statusByte22 = data[34]
+        self.statusByte23 = data[35]
 
-        # Prolink does not support mister? data[20] has lock bits
-        # if self.mister:
-        #    self.mister_status = data[20] & 0x01
-        # 
-        # Yes it appears Jacuzzi does not have a mister feature on
-        # any of its spas.
-
-        # Modified for Prolink; does not have Aux channels?
-        # It does not appear that any Jacuzzi hot tub has Aux 1 or 2
-        # for i in range(0, 2):
-        #     if not self.aux_array[i]:
-        #         continue
-        #     if i == 0:
-        #         self.aux_status[i] = data[20] & 0x08
-        #     else:
-        #         self.aux_status[i] = data[20] & 0x10
-
-        # Byte 21 = don't care? -- actually 2nd sensor of current water temp
-        # Byte 22 = don't care?
-        # Byte 23 = don't care?
-        # self.statusByte21 = data[21]
-        # self.statusByte22 = data[22]
-        # self.statusByte23 = data[23]
-
-        # Byte 24 = CLEARRAYLSB
-        # Byte 25 = CLEARRAYMSB
+        # Byte 28 = CLEARRAYLSB
+        # Byte 29 = CLEARRAYMSB
         # NOTE: MSB is actually LSB and LSB is MSB!
-        # self.clearrayTime = (data[24] * 256) + data[25]
+        self.clearrayTime = (data[28] * 256) + data[29]
 
-        # Byte 26 = WATERLSB
-        # Byte 27 = WATERMSB
+        # Byte 30 = WATERLSB
+        # Byte 31 = WATERMSB
         # NOTE: MSB is actually LSB and LSB is MSB!
-        # self.waterTime = (data[26] * 256) + data[27]
+        self.waterTime = (data[30] * 256) + data[31]
 
-        # if data[1] >= 30: # packet length including checksum byte
-            # Byte 28 = OUTERFILTERLSB
-            # Byte 29 = OUTERFILTERMSB
+        if data[1] >= 36: # packet length including checksum byte
+            # Byte 34 = OUTERFILTERLSB
+            # Byte 35 = OUTERFILTERMSB
             # NOTE: MSB is actually LSB and LSB is MSB!
-            # self.outerFilterTime = (data[28] * 256) + data[29]
+            self.outerFilterTime = (data[34] * 256) + data[35]
  
-        # if data[1] >= 32: # packet length including checksum byte
-            # Byte 30 = INNERFILTERLSB
-            # Byte 31 = INNERFILTERMSB
+        if data[1] >= 38: # packet length including checksum byte
+            # Byte 36 = INNERFILTERLSB
+            # Byte 37 = INNERFILTERMSB
             # NOTE: MSB is actually LSB and LSB is MSB!
-            # self.innerFilterTime = (data[30] * 256) + data[31]
+            self.innerFilterTime = (data[36] * 256) + data[37]
 
         # if data[1] >= 33: # packet length including checksum byte
             # Byte 32 Bits 7,6,5,4 = WiFiState
@@ -1572,39 +1840,146 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         # (type 0x23), and it adds a field for light cycle time (fast
         # or slow).
         #
-        # Byte 6 = Brightness Level
+        # Byte 6 = Light On/Off Flag
         # Byte 10 = Blue Level
+        # Byte 12 = Brightness Level (Actual percentage/level)
         # Byte 13 = Light Mode
         # Byte 18 = Green Level
         # Byte 22 = Red Level
         # Byte 24 = Light Cycle Time
 
         self.lightMode = data[13]
-        self.lightBrightness = data[6]
+        self.lightBrightness = data[12]
         self.lightR = data[22]
         self.lightG = data[18]
         self.lightB = data[10]
         self.lightCycleTime = data[24]
-        self.log.info('Light status: L: {0} R: {1} G: {2} B: {3}'.format(
-                      self.lightBrightness, 
-                      self.lightR, 
-                      self.lightG, 
-                      self.lightB))
+        # On encrypted controllers, brightness often stays at 100 even when the
+        # lights are off. Treat lights as on when mode is non-zero or any RGB
+        # channel is active (mode 0 + RGB 0/0/0 == off; mode 0x80 == color cycle).
+        self.light_status[0] = 1 if (
+            self.lightMode != 0 or self.lightR or self.lightG or self.lightB
+        ) else 0
+        self.log.info(
+            'Light status: on={0} mode={1} L:{2} R:{3} G:{4} B:{5}'.format(
+                self.light_status[0],
+                self.lightMode,
+                self.lightBrightness,
+                self.lightR,
+                self.lightG,
+                self.lightB,
+            )
+        )
 
     async def read_one_message(self):
-        """ Overrides parent method to update self.connection_state
-        and add debug logging.
-        """
-        msg = await super().read_one_message()
-        if (msg is not None and 
-            self.connection_state is not ConnectionStates.Connected
-        ):
-            self.connection_state = ConnectionStates.Connected
+        """Read one message frame from the TCP stream.
 
-        self.log.debug('Received message: {}'.format(msg.hex())
-            if msg is not None else 'Read failed'
-        )
-        return msg
+        The Prolink / RS485-to-TCP stream can contain back-to-back frames, which
+        means it's common to see two 0x7E bytes in a row at frame boundaries
+        (`... 7E 7E ...`). The original balboa.py reader reads 2 bytes at a time
+        and can misinterpret that second 0x7E as a length byte, causing the
+        reader to desynchronize and stop updating state.
+
+        This implementation is resilient: it resynchronizes on 0x7E, validates
+        reasonable lengths, validates the trailing 0x7E, and only enforces CRC
+        for non-encrypted packets (encrypted packets have CRC over encrypted
+        data; we decrypt later and recompute CRC for change-detection).
+        """
+        if not self.connected:
+            return None
+
+        # Conservative bounds; typical packets are far smaller than this.
+        MIN_LEN = 5          # addr,pf,type + checksum + endflag (minimum practical)
+        MAX_LEN = 0x80       # larger than any known Prolink frames
+
+        try:
+            while True:
+                # Ensure we have enough bytes buffered to attempt parsing.
+                if len(self._rxbuf) < 2:
+                    chunk = await self.reader.read(256)
+                    if not chunk:
+                        self.connected = False
+                        return None
+                    self._rxbuf.extend(chunk)
+
+                # Resync to start flag.
+                start_idx = self._rxbuf.find(bytes([M_STARTEND]))
+                if start_idx == -1:
+                    # No start flag in buffer; drop it.
+                    self._rxbuf.clear()
+                    continue
+                if start_idx > 0:
+                    del self._rxbuf[:start_idx]
+
+                if len(self._rxbuf) < 2:
+                    continue
+
+                rlen = self._rxbuf[1]
+                # Handle the common boundary case "...7e7e..." where the next
+                # frame's start byte appears where a length byte would be.
+                if rlen == M_STARTEND:
+                    del self._rxbuf[0]
+                    continue
+
+                if rlen < MIN_LEN or rlen > MAX_LEN:
+                    # Implausible length; drop start byte and resync.
+                    self.log.debug(f"Discarding implausible length byte 0x{rlen:02X}; resyncing")
+                    del self._rxbuf[0]
+                    continue
+
+                frame_total = 2 + rlen
+                if len(self._rxbuf) < frame_total:
+                    # Need more bytes.
+                    chunk = await self.reader.read(256)
+                    if not chunk:
+                        self.connected = False
+                        return None
+                    self._rxbuf.extend(chunk)
+                    continue
+
+                full_data = bytes(self._rxbuf[:frame_total])
+
+                # Validate end flag.
+                if full_data[-1] != M_STARTEND:
+                    # Not a valid frame; drop the first 0x7E and try again.
+                    self.log.debug(f"Frame missing end flag; dropping start and resyncing: {full_data.hex()}")
+                    del self._rxbuf[0]
+                    continue
+
+                # Consume this frame from buffer.
+                del self._rxbuf[:frame_total]
+
+                # For non-encrypted messages, validate CRC (balboa.py behavior).
+                # Encrypted messages (0xC4/0xCA/0xCC) are validated after decrypt().
+                if len(full_data) > 4 and full_data[4] not in (0xC4, 0xCA, 0xCC):
+                    crc = self.balboa_calc_cs(full_data[1:], rlen - 1)
+                    if crc != full_data[-2]:
+                        self.log.debug(
+                            f"Bad CRC; dropping. exp=0x{crc:02X} got=0x{full_data[-2]:02X} frame={full_data.hex()}"
+                        )
+                        continue
+
+                if self.connection_state is not ConnectionStates.Connected:
+                    self.connection_state = ConnectionStates.Connected
+
+                self.log.debug(f"Received message: {full_data.hex()}")
+                return bytearray(full_data)
+
+        except SocketError as err:
+            if err.errno == errno.ECONNRESET:
+                self.log.error("Connection reset by peer")
+            elif err.errno == errno.EHOSTUNREACH:
+                self.log.error("Spa unreachable")
+            elif err.errno == errno.EPIPE:
+                self.log.error("Broken pipe")
+            else:
+                self.log.error("Spa socket error: {0}".format(str(err)))
+            self.connected = False
+            await self.int_new_data_cb()
+            return None
+        except Exception as e:
+            self.log.error(f"Spa read failed: {e}")
+            return None
 
     def find_balboa_mtype(self, data):
         """ Overrides parent method to add Jacuzzi-specific message types.
@@ -1671,19 +2046,49 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
             self.log.error(f"data is None in process_message()")
             return None
 
-        # Decrypt the packet if it is encrypted
+        # Outgoing client address (Prolink WiFi module uses 0x0A). Do not
+        # auto-learn from RS485 bridge CTS frames (0x06 at 0x10) — that is the
+        # adapter, not our client slot.
+
+        # Decrypt the packet if it is encrypted (decrypt() is a no-op for non-encrypted types)
         data = self.decrypt(data)
+
+        # CLEAR_TO_SEND handling (0x06): allow one queued transmit.
+        # Frame layout: 7e 05 <addr> <pf> 06 <crc> 7e
+        if len(data) == 7 and data[0] == M_STARTEND and data[3] in (0xAF, 0xBF) and data[4] == 0x06:
+            # Mark CTS available and schedule a single flush.
+            self._tx_can_send = True
+            try:
+                asyncio.create_task(self._tx_flush_one())
+            except RuntimeError:
+                # No running loop; ignore.
+                pass
+            return None
 
         mtype = self.find_balboa_mtype(data)
         if mtype is None:
+            # Some bridges/controllers emit additional frame types that we don't
+            # currently parse (e.g. 0x06, 0xCC). Treat them as ignorable noise.
+            if len(data) > 4 and data[4] in (0x06, 0xCC):
+                return None
             self.log.debug("Unknown msg type 0x{:02X} in process_message()".format(data[4]))
- 
-        elif not self.has_changed(data):
-            mtype = None
-        elif mtype == BMTR_MOD_IDENT_RESP:
+            return None
+
+        # Always parse status updates so temperature stays current even if the
+        # checksum repeats (or we missed intermediate packets).
+        is_status_update = (mtype == PLNK_STATUS_UPDATE or mtype == PLNK_C4_STATUS_UPDATE)
+
+        # For non-status messages, drop repeats.
+        if not is_status_update and not self.has_changed(data):
+            return None
+
+        if mtype == BMTR_MOD_IDENT_RESP:
             self.parse_module_identification(data)
         # Modified for Prolink; was BMTR_STATUS_UPDATE
         elif mtype == PLNK_STATUS_UPDATE:
+            # Track checksum for optional diagnostics
+            mtval = data[4]
+            self.prev_chksums[mtval] = data[-2]
             self.parse_status_update(data)
         elif mtype == BMTR_DEVICE_CONFIG_RESP:
             self.parse_device_configuration(data)
@@ -1708,6 +2113,10 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
 
         # Support encrypted message types
         elif mtype == PLNK_C4_STATUS_UPDATE:
+            # Track checksum for optional diagnostics
+            mtval = data[4]
+            self.prev_chksums[mtval] = data[-2]
+            self.log.debug("Processing C4 status update")
             self.parse_c4_status_update(data)
         elif mtype == PLNK_CA_LIGHTS_UPDATE:
             self.parse_ca_light_status_update(data)
@@ -1787,13 +2196,24 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
                 # sleep and hope the checker fixes us
                 await asyncio.sleep(5)
                 continue
-            data = await self.read_one_message()
-            if data is None:
-                self.connection_state = ConnectionStates.Disconnected
-                await asyncio.sleep(1)
-                continue
-            self.process_message(data)
-            await asyncio.sleep(0.1)
+
+            # Drain every complete frame in the TCP buffer each iteration.
+            # RS485 bridges emit many 0x06 CTS tokens; processing one frame per
+            # 0.1s sleep starves 0xC4 status updates and leaves the UI stale.
+            processed = 0
+            while processed < 64:
+                data = await self.read_one_message()
+                if data is None:
+                    if not self.connected:
+                        self.connection_state = ConnectionStates.Disconnected
+                    break
+                self.process_message(data)
+                processed += 1
+
+            if processed == 0:
+                await asyncio.sleep(0.25)
+            else:
+                await asyncio.sleep(0.02)
 
     async def spa_configured(self):
         # TODO: make this override actually work for Jacuzzi spas
@@ -1832,11 +2252,14 @@ DATE: 05/18/23 TIME:2:40PM, WS: 103, WT 102, Pump 1: OFF, Pump 2 OFF, LED: OFF, 
         return self.currentYear
 
     def get_spadate_text(self):
-        return "Spa Date: {0}/{1}/{2}".format(
-            self.get_month(), 
+        text = "Spa Date: {0}/{1}/{2}".format(
+            self.get_month(),
             self.get_day(),
-            self.get_year()
+            self.get_year(),
         )
+        if self.currentYear and self.currentYear < 2020:
+            text += " (panel only?)"
+        return text
         
     def get_curtemp_text(self):  
         return ("Water Temp: {0}".format(self.get_curtemp()))
